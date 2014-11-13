@@ -1,0 +1,4 @@
+*.pyc
+/build
+/dist
+/frasco_stripe.egg-info
