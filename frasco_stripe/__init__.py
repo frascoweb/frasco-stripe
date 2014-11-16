@@ -99,6 +99,8 @@ class StripeFeature(Feature):
     def before_request(self):
         if self.options['add_card_view'] and current_app.features.users.logged_in():
             user = current_app.features.users.current
+            if not user.plan_name and self.options['user_must_have_plan'] and self.options['default_plan']:
+                self.subscribe_user(self.options['default_plan'], user=user)
             if ((not user.plan_name and self.options['user_must_have_plan']) or \
                 (user.plan_name and user.plan_trial_ended and not user.has_stripe_card)) and \
                request.endpoint != self.options['add_card_view'] and 'static' not in request.endpoint:
@@ -180,13 +182,10 @@ class StripeFeature(Feature):
         return subscription
 
     def update_subscription_details(self, user, subscription):
-        if subscription:
+        if subscription and subscription.status != 'canceled':
             user.stripe_subscription_id = subscription.id
             user.plan_name = subscription.plan.id
-            if subscription.trial_end:
-                user.plan_trial_ended = datetime.datetime.fromtimestamp(subscription.trial_end) < datetime.datetime.now()
-            else:
-                user.plan_trial_ended = True
+            user.plan_trial_ended = subscription.status != 'trialing'
             if user.plan_trial_ended:
                 user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
             else:
@@ -202,7 +201,7 @@ class StripeFeature(Feature):
         if not user:
             user = current_app.features.users.current
         subscription = user.stripe_subscription
-        for k, w in kwargs.iteritems():
+        for k, v in kwargs.iteritems():
             setattr(subscription, k, v)
         subscription.save()
         if "plan" in kwargs:
@@ -219,10 +218,9 @@ class StripeFeature(Feature):
 
     def update_last_subscription_charge(self, user, invoice, successful=True):
         subscription = user.stripe_subscription
-        if subscription.trial_end:
-            user.plan_trial_ended = datetime.datetime.fromtimestamp(subscription.trial_end) < datetime.datetime.now()
+        user.plan_trial_ended = subscription.status != 'trialing'
         user.plan_last_charged_at = datetime.datetime.fromtimestamp(invoice.date)
-        user.plan_last_charge_amount = invoice.total
+        user.plan_last_charge_amount = invoice.total / 100
         user.plan_last_charge_successful = successful
         if successful:
             user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
@@ -232,13 +230,13 @@ class StripeFeature(Feature):
 
     def on_invoice_payment_succeeded(self, sender, event):
         invoice = event.data.object
-        if not invoice.customer or not invoice.subscription:
+        if not invoice.customer:
             return
         user = self.find_user_by_customer_id(invoice.customer)
-        if not user or user.stripe_subscription_id != invoice.subscription.id \
-          or invoice.total == 0:
+        if not user or invoice.total == 0:
             return
-        self.update_last_subscription_charge(user, invoice)
+        if invoice.subscription and user.stripe_subscription_id == invoice.subscription:
+            self.update_last_subscription_charge(user, invoice)
         if self.options['send_invoice_email']:
             self.send_invoice_email(user, invoice)
 
@@ -247,7 +245,7 @@ class StripeFeature(Feature):
         if not invoice.customer or not invoice.subscription:
             return
         user = self.find_user_by_customer_id(invoice.customer)
-        if not user or user.stripe_subscription_id != invoice.subscription.id:
+        if not user or user.stripe_subscription_id != invoice.subscription:
             return
         self.update_last_subscription_charge(user, invoice, False)
 
@@ -282,7 +280,14 @@ class StripeFeature(Feature):
                 'stripe/trial_will_end.txt', user=user)
 
     def send_invoice_email(self, user, invoice):
+        items = []
+        for line in invoice.lines.data:
+            desc = line.description or ''
+            if line.plan:
+                desc = line.plan.statement_description
+            items.append((desc, line.amount / 100))
         current_app.features.emails.send(user.email, 'stripe/invoice.html',
-            invoice_items=[(line.description, line.amount) for line in invoice.lines.data],
+            invoice_date=datetime.datetime.fromtimestamp(invoice.date),
+            invoice_items=items,
             invoice_currency=invoice.currency.upper(),
-            invoice_total=invoice.total)
+            invoice_total=invoice.total / 100)
