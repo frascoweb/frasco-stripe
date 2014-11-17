@@ -1,5 +1,6 @@
-from frasco import (Feature, action, request, signal, current_app, redirect,\
-                    url_for, cached_property, current_context, hook, Blueprint)
+from frasco import (Feature, action, request, signal, current_app, redirect, flash,\
+                    url_for, cached_property, current_context, hook, Blueprint,\
+                    lazy_translate)
 import stripe
 import datetime
 import time
@@ -25,9 +26,15 @@ class StripeFeature(Feature):
                 "auto_create_customer": True,
                 "user_must_have_plan": False,
                 "add_card_view": None,
+                "no_payment_redirect_to": None,
+                "no_payment_message": None,
+                "subscription_past_due_message": lazy_translate(
+                    u"We attempted to charge your credit card for your subscription but it failed."
+                    "Please check your credit card details"),
                 "only_one_card": False,
                 "debug_trial_period": None,
                 "send_invoice_email": True,
+                "send_failed_invoice_email": True,
                 "send_trial_will_end_email": True,
                 "webhook_validate_event": False}
 
@@ -53,7 +60,7 @@ class StripeFeature(Feature):
                 stripe_subscription_id=dict(type=str, index=True),
                 has_stripe_card=dict(type=bool, default=False, index=True),
                 plan_name=dict(type=str, index=True),
-                plan_trial_ended=dict(type=bool, default=False, index=True),
+                plan_status=dict(type=str, default='trialing', index=True),
                 plan_last_charged_at=datetime.datetime,
                 plan_last_charge_amount=float,
                 plan_last_charge_successful=dict(type=bool, default=True, index=True),
@@ -72,6 +79,9 @@ class StripeFeature(Feature):
 
     def find_user_by_customer_id(self, cust_id):
         return current_app.features.users.query.filter(stripe_customer_id=cust_id).first()
+
+    def find_user_by_subscription_id(self, subscription_id):
+        return current_app.features.users.query.filter(stripe_subscription_id=subscription_id).first()
 
     def find_customer_from_user(self, user):
         try:
@@ -97,14 +107,24 @@ class StripeFeature(Feature):
 
     @hook()
     def before_request(self):
-        if self.options['add_card_view'] and current_app.features.users.logged_in():
+        if request.endpoint in (self.options['add_card_view'], 'users.logout') or 'static' in request.endpoint:
+            return
+        if current_app.features.users.logged_in():
             user = current_app.features.users.current
             if not user.plan_name and self.options['user_must_have_plan'] and self.options['default_plan']:
                 self.subscribe_user(self.options['default_plan'], user=user)
-            if ((not user.plan_name and self.options['user_must_have_plan']) or \
-                (user.plan_name and user.plan_trial_ended and not user.has_stripe_card)) and \
-               request.endpoint != self.options['add_card_view'] and 'static' not in request.endpoint:
-                return redirect(url_for(self.options['add_card_view']))
+            if (not user.plan_name and self.options['user_must_have_plan']) or \
+               (user.plan_name and ((user.plan_status not in ('trialing', 'active') and not user.has_stripe_card) or \
+                                     user.plan_status in ('canceled', 'unpaid'))):
+                if self.options['no_payment_message']:
+                    flash(self.options['no_payment_message'], 'error')
+                if self.options['no_payment_redirect_to']:
+                    return redirect(self.options['no_payment_redirect_to'])
+                if self.options['add_card_view']:
+                    return redirect(url_for(self.options['add_card_view']))
+            if user.plan_status == 'past_due' and \
+              self.options['subscription_past_due_message']:
+                flash(self.options['subscription_past_due_message'], 'error')
 
     @action('stripe_create_customer', default_option='user')
     def create_customer(self, user=None):
@@ -135,17 +155,20 @@ class StripeFeature(Feature):
     def add_user_card_from_form(self, user=None, form=None):
         if not user:
             user = current_app.features.users.current
-        if not form:
-            form = current_context.data.form
-        if "stripeToken" in form:
+        form = current_context.data.get('form')
+        if form and "stripeToken" in form:
             self.add_user_card(user, form.stripeToken.data)
-        else:
+        elif "stripeToken" in request.form:
+            self.add_user_card(user, request.form['stripeToken'])
+        elif form:
             self.add_user_card(user,
                 number=form.card_number.data,
                 exp_month=form.card_exp_month.data,
                 exp_year=form.card_exp_year.data,
                 cvc=form.card_cvc.data,
                 name=form.card_name.data)
+        else:
+            raise Exception("No form found to retrieve the stripeToken")
 
     @action('stripe_remove_card')
     def remove_card(self, card_id=None, user=None):
@@ -164,7 +187,9 @@ class StripeFeature(Feature):
             user.save()
 
     @action('stripe_subscribe_user', default_option='plan')
-    def subscribe_user(self, plan, quantity=1, user=None):
+    def subscribe_user(self, plan=None, quantity=1, user=None, customer=None, **kwargs):
+        if not plan:
+            plan = self.options['default_plan']
         if not user:
             user = current_app.features.users.current
         if user.plan_name == plan:
@@ -177,7 +202,10 @@ class StripeFeature(Feature):
                 trial_end = datetime.datetime.now() + \
                     datetime.timedelta(days=self.options['debug_trial_period'])
                 params['trial_end'] = int(time.mktime(trial_end.timetuple()))
-        subscription = user.stripe_customer.subscriptions.create(**params)
+        if not customer:
+            customer = user.stripe_customer
+        params.update(kwargs)
+        subscription = customer.subscriptions.create(**params)
         self.update_subscription_details(user, subscription)
         return subscription
 
@@ -185,14 +213,15 @@ class StripeFeature(Feature):
         if subscription and subscription.status != 'canceled':
             user.stripe_subscription_id = subscription.id
             user.plan_name = subscription.plan.id
-            user.plan_trial_ended = subscription.status != 'trialing'
-            if user.plan_trial_ended:
-                user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
-            else:
+            user.plan_status = subscription.status
+            if user.plan_status == 'trialing':
                 user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.trial_end)
+            else:
+                user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
         else:
             user.stripe_subscription_id = None
             user.plan_name = None
+            user.plan_status = None
             user.plan_next_charge_at = None
         user.save()
 
@@ -218,7 +247,6 @@ class StripeFeature(Feature):
 
     def update_last_subscription_charge(self, user, invoice, successful=True):
         subscription = user.stripe_subscription
-        user.plan_trial_ended = subscription.status != 'trialing'
         user.plan_last_charged_at = datetime.datetime.fromtimestamp(invoice.date)
         user.plan_last_charge_amount = invoice.total / 100
         user.plan_last_charge_successful = successful
@@ -229,65 +257,68 @@ class StripeFeature(Feature):
         user.save()
 
     def on_invoice_payment_succeeded(self, sender, event):
+        self._on_invoice_payment(event)
+
+    def on_invoice_payment_failed(self, sender, event):
+        self._on_invoice_payment(event, False)
+
+    def _on_invoice_payment(self, event, successful=True):
         invoice = event.data.object
         if not invoice.customer:
             return
         user = self.find_user_by_customer_id(invoice.customer)
         if not user or invoice.total == 0:
             return
-        if invoice.subscription and user.stripe_subscription_id == invoice.subscription:
-            self.update_last_subscription_charge(user, invoice)
-        if self.options['send_invoice_email']:
-            self.send_invoice_email(user, invoice)
-
-    def on_invoice_payment_failed(self, sender, event):
-        invoice = event.data.object
-        if not invoice.customer or not invoice.subscription:
-            return
-        user = self.find_user_by_customer_id(invoice.customer)
-        if not user or user.stripe_subscription_id != invoice.subscription:
-            return
-        self.update_last_subscription_charge(user, invoice, False)
+        if invoice.subscription:
+            sub_user = None
+            if user.stripe_subscription_id == invoice.subscription:
+                sub_user = user
+            else:
+                sub_user = self.find_user_by_subscription_id(invoice.subscription)
+            if sub_user:
+                self.update_last_subscription_charge(sub_user, invoice, successful)
+        if (successful and self.options['send_invoice_email']) or \
+           (not successful and self.options['send_failed_invoice_email']):
+            self.send_invoice_email(user.email, invoice, not successful)
 
     def on_subscription_created(self, sender, event):
         subscription = event.data.object
         user = self.find_user_by_customer_id(subscription.customer)
-        if not user:
+        if not user or user.stripe_subscription_id:
             return
         self.update_subscription_details(user, subscription)
 
     def on_subscription_updated(self, sender, event):
         subscription = event.data.object
-        user = self.find_user_by_customer_id(subscription.customer)
-        if not user or user.stripe_subscription_id != subscription.id:
-            return
-        self.update_subscription_details(user, subscription)
+        user = self.find_user_by_subscription_id(subscription.id)
+        if user:
+            self.update_subscription_details(user, subscription)
 
     def on_subscription_deleted(self, sender, event):
         subscription = event.data.object
-        user = self.find_user_by_customer_id(subscription.customer)
-        if not user or user.stripe_subscription_id != subscription.id:
-            return
-        self.update_subscription_details(user, None)
+        user = self.find_user_by_subscription_id(subscription.id)
+        if user:
+            self.update_subscription_details(user, None)
 
     def on_trial_will_end(self, sender, event):
         subscription = event.data.object
-        user = self.find_user_by_customer_id(subscription.customer)
-        if not user or user.stripe_subscription_id != subscription.id:
+        user = self.find_user_by_subscription_id(subscription.id)
+        if not user:
             return
         if self.options['send_trial_will_end_email'] and not user.has_stripe_card:
             current_app.features.emails.send(user.email,
                 'stripe/trial_will_end.txt', user=user)
 
-    def send_invoice_email(self, user, invoice):
+    def send_invoice_email(self, email, invoice, failed=False, **kwargs):
         items = []
         for line in invoice.lines.data:
             desc = line.description or ''
             if line.plan:
                 desc = line.plan.statement_description
             items.append((desc, line.amount / 100))
-        current_app.features.emails.send(user.email, 'stripe/invoice.html',
+        template = 'stripe/failed_invoice.html' if failed else 'stripe/invoice.html'
+        current_app.features.emails.send(email, template,
             invoice_date=datetime.datetime.fromtimestamp(invoice.date),
             invoice_items=items,
             invoice_currency=invoice.currency.upper(),
-            invoice_total=invoice.total / 100)
+            invoice_total=invoice.total / 100, **kwargs)
