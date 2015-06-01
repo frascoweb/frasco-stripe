@@ -132,7 +132,7 @@ class StripeFeature(Feature):
             user = current_app.features.users.current
         cust = stripe.Customer.create(email=user.email)
         user.stripe_customer_id = cust.id
-        user.save()
+        current_app.features.models.backend.save(user)
         if self.options['default_plan']:
             self.subscribe_user(self.options['default_plan'], user=user)
         return cust
@@ -146,7 +146,7 @@ class StripeFeature(Feature):
                 user.stripe_customer.default_card).delete()
         user.stripe_customer.cards.create(card=token or card_details)
         user.has_stripe_card = True
-        user.save()
+        current_app.features.models.backend.save(user)
         if not user.plan_name and self.options['user_must_have_plan'] \
           and self.options['default_plan']:
             self.subscribe_user(self.options['default_plan'], user=user)
@@ -184,7 +184,7 @@ class StripeFeature(Feature):
         if user.stripe_customer.cards.total_count == 1:
             # there was only one card
             user.has_stripe_card = False
-            user.save()
+            current_app.features.models.backend.save(user)
 
     @action('stripe_subscribe_user', default_option='plan')
     def subscribe_user(self, plan=None, quantity=1, user=None, customer=None, **kwargs):
@@ -223,7 +223,7 @@ class StripeFeature(Feature):
             user.plan_name = None
             user.plan_status = None
             user.plan_next_charge_at = None
-        user.save()
+        current_app.features.models.backend.save(user)
 
     @action('stripe_update_user_subscription', default_option='quantity')
     def update_user_subscription(self, user=None, **kwargs):
@@ -235,7 +235,7 @@ class StripeFeature(Feature):
         subscription.save()
         if "plan" in kwargs:
             user.plan_name = kwargs["plan"]
-            user.save()
+            current_app.features.models.backend.save(user)
 
     @action('stripe_cancel_user_subscription', default_option='user')
     def cancel_user_subscription(self, user=None):
@@ -254,7 +254,7 @@ class StripeFeature(Feature):
             user.plan_next_charge_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
         else:
             user.plan_next_charge_at = datetime.datetime.fromtimestamp(invoice.next_payment_attempt)
-        user.save()
+        current_app.features.models.backend.save(user)
 
     def on_invoice_payment_succeeded(self, sender, event):
         self._on_invoice_payment(event)
