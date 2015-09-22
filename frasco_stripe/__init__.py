@@ -140,7 +140,7 @@ class StripeFeature(Feature):
             return
 
     def find_model_subscription(self, obj):
-        if not obj.stripe_subscription_id:
+        if not obj.stripe_customer_id or not obj.stripe_subscription_id:
             return
         try:
             return obj.stripe_customer.subscriptions\
@@ -206,8 +206,12 @@ class StripeFeature(Feature):
 
     @action('stripe_model_delete_customer')
     @as_transaction
-    def delete_customer(self, obj):
-        obj.stripe_customer.delete()
+    def delete_customer(self, obj, silent=True):
+        try:
+            obj.stripe_customer.delete()
+        except stripe.error.InvalidRequestError as e:
+            if not silent or 'No such customer' not in e.message:
+                raise e
         self._update_model_customer(obj, None)
         save_model(obj)
 
@@ -405,6 +409,16 @@ class StripeFeature(Feature):
                 sub_obj = self.find_model_by_subscription_id(invoice.subscription)
             if sub_obj:
                 self.update_last_subscription_charge(sub_obj, invoice)
+
+        if self.options['eu_vat_support'] and self.options['billing_fields'] and\
+          current_app.features.eu_vat.is_eu_country(obj.billing_country):
+            invoice.metadata['eu_vat_exchange_rate'] = current_app.services.eu_vat.get_exchange_rate(
+                obj.billing_country, invoice.currency.upper())
+            if invoice.tax:
+                invoice.metadata['eu_vat_amount'] = round(invoice.tax * invoice.metadata['eu_vat_exchange_rate'])
+            if obj.eu_vat_number:
+                invoice.metadata['eu_vat_number'] = obj.eu_vat_number
+            invoice.save()
 
         if invoice.paid and current_app.features.exists('invoicing'):
             self.create_invoice_from_stripe(obj, invoice)
