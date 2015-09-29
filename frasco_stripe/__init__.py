@@ -49,6 +49,10 @@ class StripeFeature(Feature):
                 "eu_vat_use_address_country": False,
                 "eu_auto_vat_rate": True}
 
+    model_source_updated_signal = signal('stripe_model_source_updated')
+    model_subscription_updated_signal = signal('stripe_model_subscription_updated')
+    model_last_charge_updated_signal = signal('stripe_model_last_charge_updated')
+
     def init_app(self, app):
         stripe.api_key = self.options['api_key']
         self.api = stripe
@@ -283,6 +287,7 @@ class StripeFeature(Feature):
                 current_app.features.eu_vat.set_model_country(obj, country)
             if self.options['eu_auto_vat_rate'] and obj.stripe_subscription and obj.should_charge_eu_vat:
                 self.update_subscription(obj, tax_percent=obj.eu_vat_rate)
+        self.model_source_updated_signal.send(obj)
 
     @action('stripe_model_subscribe_plan')
     @as_transaction
@@ -354,6 +359,7 @@ class StripeFeature(Feature):
             obj.plan_name = None
             obj.plan_status = None
             obj.plan_next_charge_at = None
+        self.model_subscription_updated_signal.send(obj)
 
     @as_transaction
     def update_last_subscription_charge(self, obj, invoice):
@@ -364,6 +370,7 @@ class StripeFeature(Feature):
             obj.plan_next_charge_at = datetime.datetime.fromtimestamp(obj.stripe_subscription.current_period_end)
         else:
             obj.plan_next_charge_at = datetime.datetime.fromtimestamp(invoice.next_payment_attempt)
+        self.model_last_charge_updated_signal.send(obj)
         save_model(obj)
 
     @as_transaction
