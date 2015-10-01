@@ -344,6 +344,8 @@ class StripeFeature(Feature):
         if subscription is None:
             if obj.stripe_customer.subscriptions.total_count > 0:
                 subscription = obj.stripe_customer.subscriptions.data[0]
+        prev_plan = obj.plan_name
+        prev_status = obj.plan_status
         if subscription:
             obj.stripe_subscription_id = subscription.id
             obj.plan_name = subscription.plan.id
@@ -359,7 +361,7 @@ class StripeFeature(Feature):
             obj.plan_name = None
             obj.plan_status = None
             obj.plan_next_charge_at = None
-        self.model_subscription_updated_signal.send(obj)
+        self.model_subscription_updated_signal.send(obj, prev_plan=prev_plan, prev_status=prev_status)
 
     @as_transaction
     def update_last_subscription_charge(self, obj, invoice):
@@ -474,7 +476,7 @@ class StripeFeature(Feature):
         for line in invoice.lines.data:
             desc = line.description or ''
             if line.plan:
-                desc = line.plan.statement_description
+                desc = line.plan.statement_descriptor
             items.append((desc, line.amount / 100))
         current_app.features.emails.send(email, 'failed_invoice.html',
             invoice_date=datetime.datetime.fromtimestamp(invoice.date),
