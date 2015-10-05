@@ -39,6 +39,7 @@ class StripeFeature(Feature):
                 "debug_trial_period": None,
                 "send_trial_will_end_email": True,
                 "send_failed_invoice_email": True,
+                "invoice_ref_kwargs": {},
                 "webhook_validate_event": False,
                 "model": None,
                 "email_attribute": "email",
@@ -52,6 +53,7 @@ class StripeFeature(Feature):
     model_source_updated_signal = signal('stripe_model_source_updated')
     model_subscription_updated_signal = signal('stripe_model_subscription_updated')
     model_last_charge_updated_signal = signal('stripe_model_last_charge_updated')
+    invoice_payment_signal = signal('stripe_invoice_payment')
 
     def init_app(self, app):
         stripe.api_key = self.options['api_key']
@@ -429,22 +431,22 @@ class StripeFeature(Feature):
                 invoice.metadata['eu_vat_number'] = obj.eu_vat_number
             invoice.save()
 
+        self.invoice_payment_signal.send(invoice)
         if invoice.paid and current_app.features.exists('invoicing'):
             self.create_invoice_from_stripe(obj, invoice)
         elif not invoice.paid and self.options['send_failed_invoice_email']:
-            self.send_failed_invoice_email(getattr(obj, self.options['email_attribute']),
-                invoice)
+            self.send_failed_invoice_email(getattr(obj, self.options['email_attribute']), invoice)
 
     def create_invoice_from_stripe(self, obj, stripe_invoice):
-        with current_app.features.invoicing.create() as invoice:
+        with current_app.features.invoicing.create(**self.options['invoice_ref_kwargs']) as invoice:
             invoice.customer = obj
             invoice.email = getattr(obj, self.options['email_attribute'])
             invoice.external_id = stripe_invoice.id
             invoice.currency = stripe_invoice.currency.upper()
-            invoice.subtotal = stripe_invoice.subtotal / 100
-            invoice.total = stripe_invoice.total / 100
+            invoice.subtotal = stripe_invoice.subtotal / 100.0
+            invoice.total = stripe_invoice.total / 100.0
             invoice.tax_rate = stripe_invoice.tax_percent
-            invoice.tax_amount = stripe_invoice.tax / 100 if stripe_invoice.tax else None
+            invoice.tax_amount = stripe_invoice.tax / 100.0 if stripe_invoice.tax else None
             invoice.description = stripe_invoice.description
             invoice.issued_at = datetime.datetime.fromtimestamp(stripe_invoice.date)
             invoice.paid = stripe_invoice.paid
@@ -463,7 +465,7 @@ class StripeFeature(Feature):
             for line in stripe_invoice.lines.data:
                 item = current_app.features.invoicing.item_model()
                 item.external_id = line.id
-                item.amount = line.amount / 100
+                item.amount = line.amount / 100.0
                 item.quantity = line.quantity
                 item.currency = line.currency
                 item.description = line.description
@@ -477,12 +479,12 @@ class StripeFeature(Feature):
             desc = line.description or ''
             if line.plan:
                 desc = line.plan.statement_descriptor
-            items.append((desc, line.amount / 100))
+            items.append((desc, line.quantity, line.amount / 100.0))
         current_app.features.emails.send(email, 'failed_invoice.html',
             invoice_date=datetime.datetime.fromtimestamp(invoice.date),
             invoice_items=items,
             invoice_currency=invoice.currency.upper(),
-            invoice_total=invoice.total / 100, **kwargs)
+            invoice_total=invoice.total / 100.0, **kwargs)
 
     def on_model_eu_vat_rate_update(self, sender):
         if sender.stripe_subscription:
