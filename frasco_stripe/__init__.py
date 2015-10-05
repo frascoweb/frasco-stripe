@@ -44,6 +44,7 @@ class StripeFeature(Feature):
                 "model": None,
                 "email_attribute": "email",
                 "billing_fields": True,
+                "reset_billing_fields": True,
                 "default_subscription_tax_percent": None,
                 "eu_vat_support": None,
                 "eu_auto_vat_country": True,
@@ -213,12 +214,15 @@ class StripeFeature(Feature):
     @action('stripe_model_delete_customer')
     @as_transaction
     def delete_customer(self, obj, silent=True):
-        try:
-            obj.stripe_customer.delete()
-        except stripe.error.InvalidRequestError as e:
-            if not silent or 'No such customer' not in e.message:
-                raise e
+        if obj.stripe_customer:
+            try:
+                obj.stripe_customer.delete()
+            except stripe.error.InvalidRequestError as e:
+                if not silent or 'No such customer' not in e.message:
+                    raise e
         self._update_model_customer(obj, None)
+        if obj.stripe_subscription_id:
+            self._update_model_subscription(obj, False)
         save_model(obj)
 
     def _update_model_customer(self, obj, cust):
@@ -270,7 +274,7 @@ class StripeFeature(Feature):
             customer = obj.stripe_customer
         obj.has_stripe_source = customer.default_source is not None if customer else False
         obj.__dict__.pop('stripe_default_source', None)
-        if self.options['billing_fields']:
+        if self.options['billing_fields'] and (obj.has_stripe_source or self.options['reset_billing_fields']):
             billing_fields = ('name', 'address_line1', 'address_line2', 'address_state', 'address_city',
                 'address_zip', 'address_country', 'country', 'brand', 'exp_month', 'exp_year', 'last4')
             source = obj.stripe_default_source if obj.has_stripe_source else None
@@ -361,7 +365,7 @@ class StripeFeature(Feature):
         else:
             obj.stripe_subscription_id = None
             obj.plan_name = None
-            obj.plan_status = None
+            obj.plan_status = 'canceled'
             obj.plan_next_charge_at = None
         self.model_subscription_updated_signal.send(obj, prev_plan=prev_plan, prev_status=prev_status)
 
