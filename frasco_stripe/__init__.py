@@ -49,7 +49,8 @@ class StripeFeature(Feature):
                 "eu_vat_support": None,
                 "eu_auto_vat_country": True,
                 "eu_vat_use_address_country": False,
-                "eu_auto_vat_rate": True}
+                "eu_auto_vat_rate": True,
+                "auto_assets": True}
 
     model_source_updated_signal = signal('stripe_model_source_updated')
     model_subscription_updated_signal = signal('stripe_model_subscription_updated')
@@ -74,6 +75,8 @@ class StripeFeature(Feature):
 
         if app.features.exists('assets'):
             app.assets.register({'stripejs': ['https://js.stripe.com/v2/#.js']})
+            if self.options['auto_assets']:
+                 app.features.assets.add_default("@stripejs")
             if 'publishable_key' in self.options:
                 app.config['EXPORTED_JS_VARS']['STRIPE_PUBLISHABLE_KEY'] = self.options['publishable_key']
 
