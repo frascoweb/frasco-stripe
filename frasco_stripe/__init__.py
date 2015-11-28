@@ -275,7 +275,8 @@ class StripeFeature(Feature):
     def _update_model_source(self, obj, customer=None, store_ip_address=True):
         if not customer:
             customer = obj.stripe_customer
-        obj.has_stripe_source = customer.default_source is not None if customer else False
+        obj.has_stripe_source = customer.default_source is not None \
+            if customer and not getattr(customer, 'deleted', False) else False
         obj.__dict__.pop('stripe_default_source', None)
         if self.options['billing_fields'] and (obj.has_stripe_source or self.options['reset_billing_fields']):
             billing_fields = ('name', 'address_line1', 'address_line2', 'address_state', 'address_city',
