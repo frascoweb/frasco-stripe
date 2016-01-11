@@ -1,6 +1,6 @@
 from frasco import (Feature, action, request, signal, current_app, redirect, flash,\
                     url_for, cached_property, current_context, hook, Blueprint,\
-                    lazy_translate, command)
+                    lazy_translate, command, current_context)
 from frasco.utils import unknown_value
 from frasco_models import as_transaction, save_model
 import stripe
@@ -27,7 +27,9 @@ def webhook():
 class StripeFeature(Feature):
     name = "stripe"
     blueprints = [bp]
-    defaults = {"default_plan": None,
+    defaults = {"default_currency": None,
+                "enable_subscriptions": True,
+                "default_plan": None,
                 "auto_create_customer": True,
                 "must_have_plan": False,
                 "add_source_view": None,
@@ -39,6 +41,7 @@ class StripeFeature(Feature):
                 "debug_trial_period": None,
                 "send_trial_will_end_email": True,
                 "send_failed_invoice_email": True,
+                "create_charge_invoice": True,
                 "invoice_ref_kwargs": {},
                 "webhook_validate_event": False,
                 "model": None,
@@ -60,15 +63,15 @@ class StripeFeature(Feature):
     def init_app(self, app):
         stripe.api_key = self.options['api_key']
         self.api = stripe
-        stripe_creatable_attributes = ('Charge', 'Customer', 'Plan', 'Coupon', 'Invoice',
+        stripe_creatable_attributes = ('Customer', 'Plan', 'Coupon', 'Invoice',
             'InvoiceItem', 'Transfer', 'Recipient')
         stripe_attributes = stripe_creatable_attributes + \
             ('ApplicationFee', 'Account', 'Balance', 'Event', 'Token')
         for attr in stripe_attributes:
             setattr(self, attr, getattr(stripe, attr))
-            app.actions.register(action("stripe_retrieve_" + attr.lower())(getattr(stripe, attr).retrieve))
+            app.actions.register(action("stripe_retrieve_" + attr.lower(), as_=attr.lower())(getattr(stripe, attr).retrieve))
         for attr in stripe_creatable_attributes:
-            app.actions.register(action("stripe_create_" + attr.lower())(getattr(stripe, attr).create))
+            app.actions.register(action("stripe_create_" + attr.lower(), as_=attr.lower())(getattr(stripe, attr).create))
 
         if app.features.exists("emails"):
             app.features.emails.add_templates_from_package(__name__)
@@ -90,24 +93,27 @@ class StripeFeature(Feature):
         if self.options["model"]:
             self.model = app.features.models.ensure_model(self.options["model"],
                 stripe_customer_id=dict(type=str, index=True),
-                stripe_subscription_id=dict(type=str, index=True),
-                has_stripe_source=dict(type=bool, default=False, index=True),
-                plan_name=dict(type=str, index=True),
-                plan_status=dict(type=str, default='trialing', index=True),
-                plan_last_charged_at=datetime.datetime,
-                plan_last_charge_amount=float,
-                plan_last_charge_successful=dict(type=bool, default=True, index=True),
-                plan_next_charge_at=dict(type=datetime.datetime, index=True))
+                has_stripe_source=dict(type=bool, default=False, index=True))
             self.model.stripe_customer = cached_property(self.find_model_customer)
-            self.model.stripe_subscription = cached_property(self.find_model_subscription)
-            self.model.stripe_default_source = cached_property(self.find_model_default_source)
             signal('stripe_customer_source_updated').connect(self.on_source_event)
             signal('stripe_customer_source_deleted').connect(self.on_source_event)
             signal('stripe_invoice_payment_succeeded').connect(self.on_invoice_payment)
             signal('stripe_invoice_payment_failed').connect(self.on_invoice_payment)
-            signal('stripe_customer_subscription_updated').connect(self.on_subscription_event)
-            signal('stripe_customer_subscription_deleted').connect(self.on_subscription_event)
-            signal('stripe_customer_subscription_trial_will_end').connect(self.on_trial_will_end)
+
+            if self.options['enable_subscriptions']:
+                app.features.models.ensure_model(self.options["model"],
+                    stripe_subscription_id=dict(type=str, index=True),
+                    plan_name=dict(type=str, index=True),
+                    plan_status=dict(type=str, default='trialing', index=True),
+                    plan_last_charged_at=datetime.datetime,
+                    plan_last_charge_amount=float,
+                    plan_last_charge_successful=dict(type=bool, default=True, index=True),
+                    plan_next_charge_at=dict(type=datetime.datetime, index=True))
+                self.model.stripe_subscription = cached_property(self.find_model_subscription)
+                self.model.stripe_default_source = cached_property(self.find_model_default_source)
+                signal('stripe_customer_subscription_updated').connect(self.on_subscription_event)
+                signal('stripe_customer_subscription_deleted').connect(self.on_subscription_event)
+                signal('stripe_customer_subscription_trial_will_end').connect(self.on_trial_will_end)
 
             if self.options['billing_fields']:
                 app.features.models.ensure_model(self.model,
@@ -166,6 +172,8 @@ class StripeFeature(Feature):
             return obj.stripe_customer.sources.retrieve(default_id)
 
     def check_model(self, obj):
+        if not self.options['enable_subscriptions']:
+            return
         if not obj.plan_name and self.options['must_have_plan'] and self.options['default_plan']:
             self.subscribe_plan(obj, self.options['default_plan'])
         if (not obj.plan_name and self.options['must_have_plan']) or \
@@ -187,7 +195,7 @@ class StripeFeature(Feature):
         if current_app.features.users.logged_in() and self.model_is_user:
             self.check_model(current_app.features.users.current)
 
-    @action('stripe_model_create_customer', default_option='obj')
+    @action('stripe_model_create_customer', default_option='obj', as_='stripe_customer')
     @as_transaction
     def create_customer(self, obj, trial_end=None, coupon=None, tax_percent=None, **kwargs):
         if 'plan' in kwargs:
@@ -299,7 +307,36 @@ class StripeFeature(Feature):
                 self.update_subscription(obj, tax_percent=obj.eu_vat_rate)
         self.model_source_updated_signal.send(obj)
 
-    @action('stripe_model_subscribe_plan')
+    @action('stripe_create_charge', as_='charge')
+    def create_charge(self, source, amount, currency=None, invoice_customer=None, invoice_lines=None,
+                      invoice_tax_rate=None, **kwargs):
+        if currency is None:
+            if not self.options['default_currency']:
+                raise Exception('Missing currency')
+            currency = self.options['default_currency']
+
+        try:
+            charge = stripe.Charge.create(amount=int(amount), currency=currency,
+                source=source, **kwargs)
+        except stripe.error.CardError as e:
+            current_context['charge_error'] = e.json_body['error']
+            current_context.exit(trigger_action_group='charge_failed')
+        except Exception as e:
+            current_context['charge_error'] = {'message': e.message}
+            current_context.exit(trigger_action_group='charge_failed')
+
+        if self.options['create_charge_invoice'] and 'invoicing' in current_app.features:
+            current_context['invoice'] = self.create_invoice_from_charge(charge, obj=invoice_customer,
+                lines=invoice_lines, tax_rate=invoice_tax_rate)
+
+        return charge
+            
+    @action('stripe_model_create_charge', as_='charge')
+    def create_customer_charge(self, obj, amount):
+        return self.create_charge(None, amount, customer=obj.stripe_customer.id,
+            invoice_customer=obj, **kwargs)
+
+    @action('stripe_model_subscribe_plan', as_='subscription')
     @as_transaction
     def subscribe_plan(self, obj, plan=None, quantity=1, **kwargs):
         if not plan:
@@ -445,10 +482,44 @@ class StripeFeature(Feature):
         elif not invoice.paid and self.options['send_failed_invoice_email']:
             self.send_failed_invoice_email(getattr(obj, self.options['email_attribute']), invoice)
 
+    @action('stripe_create_invoice_from_charge', default_option='charge', as_='invoice')
+    def create_invoice_from_charge(self, charge, obj=None, lines=None, tax_rate=None):
+        with current_app.features.invoicing.create(**self.options['invoice_ref_kwargs']) as invoice:
+            invoice.currency = charge.currency.upper()
+            invoice.subtotal = charge.amount / 100.0
+            invoice.total = charge.amount / 100.0
+            invoice.description = charge.description
+            invoice.issued_at = datetime.datetime.fromtimestamp(charge.created)
+            invoice.charge_id = charge.id
+            invoice.paid = charge.status == "succeeded"
+            if obj is not None:
+                self._fill_invoice_from_obj(invoice, obj)
+
+            if tax_rate and tax_rate == "eu_vat":
+                if current_app.features.eu_vat.is_eu_country(invoice.country):
+                    tax_rate = current_app.services.eu_vat.get_vat_rate(invoice.country)
+                    if not current_app.features.eu_vat.should_charge_vat(invoice.country, obj.eu_vat_number):
+                        tax_rate = None
+                else:
+                    tax_rate = None
+            if tax_rate:
+                invoice.tax_rate = tax_rate
+                invoice.subtotal = invoice.total * (100 / (100 + tax_rate));
+                invoice.tax_amount = invoice.total - invoice.subtotal
+
+            if lines:
+                for line in lines:
+                    item = current_app.features.invoicing.item_model()
+                    item.amount = line['amount']
+                    item.quantity = line.get('quantity', 1)
+                    item.currency = line.get('currency', charge.currency.upper())
+                    item.description = line['description']
+                    invoice.items.append(item)
+
     def create_invoice_from_stripe(self, obj, stripe_invoice):
         with current_app.features.invoicing.create(**self.options['invoice_ref_kwargs']) as invoice:
-            invoice.customer = obj
-            invoice.email = getattr(obj, self.options['email_attribute'])
+            self._fill_invoice_from_obj(obj)
+
             invoice.external_id = stripe_invoice.id
             invoice.currency = stripe_invoice.currency.upper()
             invoice.subtotal = stripe_invoice.subtotal / 100.0
@@ -460,16 +531,6 @@ class StripeFeature(Feature):
             invoice.paid = stripe_invoice.paid
             invoice.charge_id = stripe_invoice.charge
 
-            if self.options['billing_fields']:
-                invoice.name = obj.billing_name
-                invoice.address_line1 = obj.billing_address_line1
-                invoice.address_line2 = obj.billing_address_line2
-                invoice.address_city = obj.billing_address_city
-                invoice.address_state = obj.billing_address_state
-                invoice.address_zip = obj.billing_address_zip
-                invoice.address_country = obj.billing_address_country
-                invoice.country = obj.billing_country.upper()
-
             for line in stripe_invoice.lines.data:
                 item = current_app.features.invoicing.item_model()
                 item.external_id = line.id
@@ -480,6 +541,19 @@ class StripeFeature(Feature):
                 if line.plan:
                     item.description = line.plan.statement_descriptor
                 invoice.items.append(item)
+
+    def _fill_invoice_from_obj(self, invoice, obj):
+        invoice.customer = obj
+        invoice.email = getattr(obj, self.options['email_attribute'])
+        if self.options['billing_fields']:
+            invoice.name = obj.billing_name
+            invoice.address_line1 = obj.billing_address_line1
+            invoice.address_line2 = obj.billing_address_line2
+            invoice.address_city = obj.billing_address_city
+            invoice.address_state = obj.billing_address_state
+            invoice.address_zip = obj.billing_address_zip
+            invoice.address_country = obj.billing_address_country
+            invoice.country = obj.billing_country.upper() if obj.billing_country else obj.billing_address_country.upper()
 
     def send_failed_invoice_email(self, email, invoice, **kwargs):
         items = []
