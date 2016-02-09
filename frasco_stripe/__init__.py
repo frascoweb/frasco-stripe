@@ -518,7 +518,7 @@ class StripeFeature(Feature):
 
     def create_invoice_from_stripe(self, obj, stripe_invoice):
         with current_app.features.invoicing.create(**self.options['invoice_ref_kwargs']) as invoice:
-            self._fill_invoice_from_obj(obj)
+            self._fill_invoice_from_obj(invoice, obj)
 
             invoice.external_id = stripe_invoice.id
             invoice.currency = stripe_invoice.currency.upper()
