@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='frasco-stripe',
-    version='0.5.1',
+    version='0.5.2',
     url='http://github.com/frascoweb/frasco-stripe',
     license='MIT',
     author='Maxime Bouroumeau-Fuseau',

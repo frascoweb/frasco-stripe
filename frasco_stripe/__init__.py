@@ -553,7 +553,10 @@ class StripeFeature(Feature):
             invoice.address_state = obj.billing_address_state
             invoice.address_zip = obj.billing_address_zip
             invoice.address_country = obj.billing_address_country
-            invoice.country = obj.billing_country.upper() if obj.billing_country else obj.billing_address_country.upper()
+            if obj.billing_country:
+                invoice.country = obj.billing_country.upper() 
+            elif obj.billing_address_country:
+                invoice.country = obj.billing_address_country.upper()
 
     def send_failed_invoice_email(self, email, invoice, **kwargs):
         items = []
