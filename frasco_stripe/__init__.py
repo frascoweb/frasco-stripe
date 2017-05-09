@@ -417,8 +417,10 @@ class StripeFeature(Feature):
         obj.plan_last_charge_successful = invoice.paid
         if invoice.paid:
             obj.plan_next_charge_at = datetime.datetime.fromtimestamp(obj.stripe_subscription.current_period_end)
-        else:
+        elif invoice.next_payment_attempt:
             obj.plan_next_charge_at = datetime.datetime.fromtimestamp(invoice.next_payment_attempt)
+        else:
+            obj.plan_next_charge_at = None
         self.model_last_charge_updated_signal.send(obj)
         save_model(obj)
 
