@@ -539,9 +539,7 @@ class StripeFeature(Feature):
                 item.amount = line.amount / 100.0
                 item.quantity = line.quantity
                 item.currency = line.currency
-                item.description = line.description
-                if line.plan:
-                    item.description = line.plan.statement_descriptor
+                item.description = line.description or ''
                 invoice.items.append(item)
 
     def _fill_invoice_from_obj(self, invoice, obj):
@@ -563,10 +561,7 @@ class StripeFeature(Feature):
     def send_failed_invoice_email(self, email, invoice, **kwargs):
         items = []
         for line in invoice.lines.data:
-            desc = line.description or ''
-            if line.plan:
-                desc = line.plan.statement_descriptor
-            items.append((desc, line.quantity, line.amount / 100.0))
+            items.append((line.description or '', line.quantity, line.amount / 100.0))
         current_app.features.emails.send(email, 'failed_invoice.html',
             invoice_date=datetime.datetime.fromtimestamp(invoice.date),
             invoice_items=items,
